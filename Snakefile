@@ -457,7 +457,6 @@ if STAR_ROOT==True:
             node_data = "results/star_branch_lengths.json",
         params:
             strain_id_field = ID_FIELD,
-            root = ROOTING,
             recombinant_clades = RECOMBINANT_CLADES,
             root_name = "NODE_0000000"
         log:
@@ -477,13 +476,12 @@ if STAR_ROOT==True:
             augur refine \
             --tree {output.tree} \
             --alignment {input.alignment} \
-            --root {params.root_name} \
+            --root {ROOTING} \
             --keep-polytomies \
             --divergence-unit mutations-per-site \
             --output-node-data {output.node_data} \
             --output-tree {output.tree}
             """
-
 
 rule ancestral:
     input:
