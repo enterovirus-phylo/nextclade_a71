@@ -1,0 +1,22 @@
+# Maps clade/subgenogroup names onto the ground-truth nomenclature used for scoring,
+# which is the `clade_membership` column of testing/nextstrain_vp1_metadata.tsv.
+#
+# tool      "rivm" or "nextclade" - the tool whose output is being renamed
+# from      the name as that tool reports it
+# to        the equivalent name in clade_membership
+#
+# Only genuine renames belong here. Coarser-vs-finer answers do NOT: the scorer
+# understands the clade hierarchy (C for a C1 fragment is scored `ancestral`,
+# B2 for a B fragment `descendant`), so RIVM's coarse C1/C2 labels need no mapping.
+#
+# ---------------------------------------------------------------------------------
+# Evidence: cross-tabulation of resources/subgenotypes_rivm.csv against
+# clade_membership over the 9,127 sequences carrying both labels. Every RIVM label
+# below maps 1:1 unless noted.
+# ---------------------------------------------------------------------------------
+tool	from	to
+rivm	Br	A
+rivm	B0	B1
+#
+# All remaining RIVM labels (B1, B3, B4, B5, C1, C2, C3, C4, C5, D, E, F, G) matched
+# clade_membership exactly and need no mapping.

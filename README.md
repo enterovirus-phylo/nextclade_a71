@@ -245,6 +245,55 @@ The workflow will:
 - `STATIC_ANCESTRAL_INFERRENCE = True` — enables inferred root in the dataset (default)
 - `INFERRENCE_RERUN = False` — set to `True` only when regenerating the root (default: `False`)
 
+### Benchmarking clade assignment against the RIVM typing tool
+
+`rule test_clades` compares Nextclade against the [RIVM Enterovirus Genotyping
+Tool](https://www.rivm.nl/mpf/typingtool/enterovirus/) on the same set of sequence
+fragments, to quantify how each tool degrades as the input shrinks and moves away from
+VP1. The RIVM tool is a web service with no API, so the round-trip is manual:
+
+```bash
+# 1. Generate the fragment set and the upload FASTA
+snakemake --cores 9 test_out/fragments_for_rivm.fasta
+
+# 2. Upload test_out/fragments_for_rivm.fasta to the RIVM Enterovirus Genotyping Tool,
+#    then save the CSV export as testing/rivm_results.csv
+
+# 3. Score both tools and draw the figures
+snakemake --cores 9 test_all
+```
+
+Outputs land in `test_out/`:
+
+| file | contents |
+|---|---|
+| `fragment_metadata.tsv` | one row per fragment: parent accession, region, length, true coordinates, both whole-genome ground truths |
+| `clade_assignment_report.tsv` | per-fragment calls and outcomes for both tools |
+| `clade_assignment_summary.tsv` | counts and rates with 95% Wilson CIs, by region and length |
+| `clade_assignment_summary_global.tsv` | the same, rolled up per region and overall |
+| `figures/` | assignment rate, accuracy-given-assigned, outcome composition, confusion, outcome by genomic position |
+| `benchmarks/` | Snakemake runtimes plus `/usr/bin/time -v` output for the Nextclade runs |
+
+**Fragment design** is set at the top of the Snakefile: `FRAGMENT_LENGTHS` x
+(`FRAGMENT_GENES` + a random whole-genome window) x `FRAGMENT_REPLICATES`. The replicates
+are what make the confidence intervals meaningful, and parent sequences are drawn
+round-robin across clades so the benchmark does not collapse onto the few
+heavily-sequenced ones. Keep the total within a single RIVM batch (~200-300); cells where
+the requested length exceeds the gene are skipped, so e.g. no 1500nt VP1 fragments exist.
+
+**Two metrics are reported per tool.** *Agreement* scores the fragment call against the
+shared Nextstrain ground truth (after nomenclature mapping via
+`resources/clade_name_map.tsv`), and *self-consistency* scores it against the same tool's
+own whole-genome call on the parent sequence. Outcomes are not binary: `exact`,
+`ancestral` (a correct but less-resolved parent clade, e.g. C2 for a C2.3 fragment),
+`wrong_clade`, `wrong_type` (typed as another serotype) and `unassigned` are counted
+separately, because "could not answer" and "answered wrongly" are very different failures.
+
+**Note on staleness.** `testing/rivm_results.csv` has no producing rule - if the fragment
+set is regenerated, the old export no longer matches and RIVM would silently appear to
+assign nothing. `compare_clade_assignments.py` therefore fails loudly when too many
+fragments are missing from the export; re-do the upload when that happens.
+
 ### Labeling Mutations of Interest
 
 To label mutations of interest, execute the `mutLabels` rule as a standalone instance. They will be added to the `out-dataset/pathogen.json` file.

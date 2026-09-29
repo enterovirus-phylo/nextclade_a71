@@ -43,6 +43,16 @@ VIRUS_ABBREV =           "EV-A71"    # short abbreviation for the target virus, 
 SPECIES_TAXID =          "138948"    # NCBI taxon ID for the species the target virus belongs to (used to fetch other serotypes of the same species for recombination tests)
 RELATED_SPECIES_LABEL =  "EV-A"      # optional: label for a closely related species to flag separately in the test QC breakdown (set to "" to disable)
 
+# Fragment benchmark design (rules `test` / `test_clades`).
+# lengths x (genes + whole genome) x replicates fragments are generated; the replicates
+# give the per-cell confidence intervals, so keep the total within what can reasonably be
+# pushed through the RIVM web tool in one batch (~200-300).
+FRAGMENT_GENES =         ["VP1", "3D"]   # currently only genes annotated in the GFF3 are supported
+FRAGMENT_LENGTHS =       [100, 200, 300, 500, 700, 1000, 1500, 2500]
+FRAGMENT_REPLICATES =    10              # main arm: every region draws from all eligible parents
+FRAGMENT_MATCHED_REPLICATES = 5          # matched arm: all regions draw from parents covering
+                                         # every region, so cross-region comparison is unconfounded
+
 STAR_ROOT = True                   # whether to use star-like rooting method
 FETCH_SEQUENCES = True              # whether to fetch sequences from NCBI Virus via ingest workflow
 STATIC_ANCESTRAL_INFERRENCE = True  # whether to use the static inferred ancestral sequence
@@ -58,7 +68,7 @@ configfile: PATHOGEN_JSON
 rule all:
     input:
         auspice = "results/auspice.json",
-        augur_jsons = "test_out/",
+        augur_jsons = "test_out/nextclade.tsv",  # rule `test`; a literal path since rule test is defined further below
         data = "dataset.zip",
         seqs = "results/example_sequences.fasta",
         json = "results/virus_properties.json",
@@ -888,9 +898,32 @@ rule mutLabels:
         zip -rj dataset.zip  out-dataset/*
         """
 
+## Align every candidate parent to the reference once, so fragments can be cut in
+## reference coordinates. This is what lets partial sequences (the bulk of EV-A71
+## GenBank records are VP1 amplicons) contribute fragments in the regions they cover,
+## instead of restricting the benchmark to the few full-length genomes - most of which
+## are in the reference tree and therefore ineligible. Used only for coordinate
+## mapping; no clade call from this run enters the benchmark.
+rule align_fragment_parents:
+    input:
+        dataset = rules.assemble_dataset.output.dataset_zip,
+        sequences = SEQUENCES,
+    output:
+        aligned = "test_out/parents_aligned.fasta",
+    log:
+        "logs/align_fragment_parents.log",
+    shell:
+        """
+        nextclade3 run \
+            --input-dataset {input.dataset} \
+            --output-fasta {output.aligned} \
+            {input.sequences} > {log} 2>&1
+        """
+
 rule test:
     input:
-        dataset = rules.assemble_dataset.output.dataset_zip,    # output dataset
+        dataset = rules.assemble_dataset.output.dataset_zip,
+        aligned = rules.align_fragment_parents.output.aligned,  # parents in reference coordinates
         sequences = SEQUENCES,                                  # NCBI sequences
         ex_sequences = rules.assemble_dataset.output.sequences, # example sequences
         nextstrain = "testing/nextstrain_vp1_metadata.tsv",     # Nextstrain VP1 assignment
@@ -902,7 +935,14 @@ rule test:
         tree = "out-dataset/tree.json",
         properties = "results/virus_properties.json",
     output:
-        output = directory("test_out"),
+        # concrete files rather than directory("test_out"): other rules (test_clades,
+        # plot_clade_comparison) write into the same directory, which Snakemake forbids
+        # when the directory itself is declared as an output.
+        fragments = "test_out/fragments.fasta",
+        fragment_metadata = "test_out/fragment_metadata.tsv",
+        nextclade_tsv = "test_out/nextclade.tsv",
+        all_sequences = "test_out/all_test_sequences.fasta",
+        qc_plot = "test_out/test_sequences_qc_distribution.png",
     params:
         do_alignment = "False",                                 # set to True to test the alignment of fragments (will run mafft on the fragments and reference)
         seed = 42,                                              # random seed number
@@ -912,12 +952,17 @@ rule test:
         abbrev = VIRUS_ABBREV,
         related_label = RELATED_SPECIES_LABEL,                  # closely related species to flag separately (optional)
         related_patterns = ["EV-A,CVA"],
-        fragment_genes = ["VP1", "3D"]                          # currently only genes supported
+        fragment_genes = " ".join(FRAGMENT_GENES),              # currently only genes supported
+        fragment_lengths = " ".join(str(l) for l in FRAGMENT_LENGTHS),
+        fragment_replicates = FRAGMENT_REPLICATES,
+        fragment_matched_replicates = FRAGMENT_MATCHED_REPLICATES,
+    benchmark:
+        "test_out/benchmarks/test.tsv"
     log:
         "test_out/test.log"
     shell:
         """
-        mkdir -p {output.output}
+        mkdir -p test_out test_out/benchmarks
 
         # Generate test sequences
         python scripts/generate_test_sequences.py \
@@ -928,44 +973,51 @@ rule test:
             --ev {input.related_species} \
             --taxid {params.species_taxid}\
             --virus "{params.virus}"\
-            --output-fragments {output.output}/fragments.fasta \
-            --output-recombinants {output.output}/recombinants.fasta \
-            --output-ev {output.output}/related_species_fetched.fasta \
+            --aligned {input.aligned} \
+            --genes {params.fragment_genes} \
+            --lengths {params.fragment_lengths} \
+            --replicates {params.fragment_replicates} \
+            --matched-replicates {params.fragment_matched_replicates} \
+            --output-fragments {output.fragments} \
+            --output-fragment-metadata {output.fragment_metadata} \
+            --output-recombinants test_out/recombinants.fasta \
+            --output-ev test_out/related_species_fetched.fasta \
             --seed {params.seed}
 
         # Use provided related-species sequences if available, else use fetched
         if [ -f "{input.related_species}" ]; then
             RELATED_FILE="{input.related_species}"
         else
-            RELATED_FILE="{output.output}/related_species_fetched.fasta"
+            RELATED_FILE="test_out/related_species_fetched.fasta"
         fi
 
         # Filter input sequences to >100 nt, then randomly subsample to 10,000
         seqkit seq -m 101 {input.sequences} \
-            | seqkit sample -n 5000 -s {params.seed} > {output.output}/sequences_subset.fasta
+            | seqkit sample -n 5000 -s {params.seed} > test_out/sequences_subset.fasta
 
         # Combine all test sequences
-        cat {output.output}/sequences_subset.fasta \
-            {output.output}/fragments.fasta \
-            {output.output}/recombinants.fasta \
+        cat test_out/sequences_subset.fasta \
+            test_out/fragments.fasta \
+            test_out/recombinants.fasta \
             {input.non_targets} \
-            "$RELATED_FILE" > {output.output}/all_test_sequences.fasta
+            "$RELATED_FILE" > test_out/all_test_sequences.fasta
 
         # Run Nextclade
         echo "\nRunning Nextclade3 on all test sequences..."
         time nextclade3 run \
             --input-dataset {input.dataset} \
-            --output-all {output.output} \
-            {output.output}/all_test_sequences.fasta \
+            --output-all test_out \
+            test_out/all_test_sequences.fasta \
             > {log} 2>&1
         echo "\nNextclade3 run completed. Log written to {log}."
 
         # Parse results
         python scripts/parse_nextclade_log.py \
             --log-file {log} \
-            --fasta-file {output.output}/all_test_sequences.fasta \
-            --tsv-file {output.output}/nextclade.tsv \
-            --output-dir {output.output} \
+            --fasta-file test_out/all_test_sequences.fasta \
+            --tsv-file test_out/nextclade.tsv \
+            --fragment-metadata {output.fragment_metadata} \
+            --output-dir test_out \
             --virus-name "{params.virus}" \
             --tree-file {input.tree} \
             --short-name {params.abbrev} \
@@ -976,39 +1028,116 @@ rule test:
 
         # Optional: align failed sequences with MAFFT
         if [ "{params.do_alignment}" = "True" ]; then
-            mafft --thread 9 --addfragments {output.output}/failed_sequences.fasta {input.reference} > {output.output}/failed_sequences_aligned.fasta
+            mafft --thread 9 --addfragments test_out/failed_sequences.fasta {input.reference} > test_out/failed_sequences_aligned.fasta
         fi
         """
 
-## Test clade assignment
+## Package the fragments for the manual RIVM round-trip.
+## Upload the resulting FASTA to the RIVM Enterovirus Genotyping Tool and save the
+## CSV export as testing/rivm_results.csv, then run `snakemake test_clades`.
+## The non-target sequences are kept in a SEPARATE file: they are an optional
+## false-positive control (does either tool assign an EV-A71 clade to out-of-scope
+## input?), not part of the fragment benchmark, and mixing them into the fragment
+## upload would put non-fragments into the fragment results.
+rule prepare_rivm_input: # 1492684036
+    input:
+        fragments = rules.test.output.fragments,
+        metadata = rules.test.output.fragment_metadata,
+        non_targets = NON_TARGET_SEQUENCES,
+    output:
+        upload = "test_out/fragments_for_rivm.fasta",
+        controls = "test_out/controls_for_rivm.fasta",
+    shell:
+        """
+        cp {input.fragments} {output.upload}
+        cp {input.non_targets} {output.controls}
+        echo "Upload {output.upload} ($(grep -c '^>' {output.upload}) fragments) to the"
+        echo "RIVM Enterovirus Genotyping Tool, then save the CSV as testing/rivm_results.csv"
+        echo "Optional negative control: {output.controls} ($(grep -c '^>' {output.controls}) sequences)"
+        """
+
+## Test clade assignment: Nextclade vs RIVM on the same fragments
 rule test_clades:
     input:
         dataset = rules.assemble_dataset.output.dataset_zip,
-        fragments = "test_out/fragments.fasta",
+        fragments = rules.test.output.fragments,
+        metadata = rules.test.output.fragment_metadata,
+        sequences = SEQUENCES,
         rivm_results = "testing/rivm_results.csv",
+        name_map = "resources/clade_name_map.tsv",
     output:
         report = "test_out/clade_assignment_report.tsv",
-        summary = "test_out/clade_assignment_summary.tsv"
+        summary = "test_out/clade_assignment_summary.tsv",
+        summary_global = "test_out/clade_assignment_summary_global.tsv",
     params:
-        recombinant_clades = ",".join(RECOMBINANT_CLADES)
+        recombinant_clades = ",".join(RECOMBINANT_CLADES),
+        virus = VIRUS_ABBREV,
+    benchmark:
+        "test_out/benchmarks/test_clades.tsv"
     log:
         "test_out/clade_assignment.log"
     shell:
         """
-        mkdir -p test_out/clade_assignment_results
+        mkdir -p test_out/clade_assignment_results test_out/benchmarks
 
-        time nextclade3 run \
+        # Nextclade on the fragments. /usr/bin/time writes to its own file: the shell
+        # builtin `time` sends timing to the shell's stderr, where it was being lost.
+        /usr/bin/time -v -o test_out/benchmarks/nextclade_fragments.time \
+            nextclade3 run \
             --input-dataset {input.dataset} \
             --output-all test_out/clade_assignment_results \
             {input.fragments} > {log} 2>&1
 
+        # Nextclade on the parent whole genomes, for the self-consistency metric
+        tail -n +2 {input.metadata} | cut -f2 | sort -u > test_out/parent_accessions.txt
+        seqkit grep -f test_out/parent_accessions.txt {input.sequences} \
+            > test_out/parent_sequences.fasta
+
+        nextclade3 run \
+            --input-dataset {input.dataset} \
+            --output-tsv test_out/clade_assignment_results/nextclade_wg.tsv \
+            test_out/parent_sequences.fasta >> {log} 2>&1
+
         python scripts/compare_clade_assignments.py \
-            test_out/clade_assignment_results/nextclade.tsv \
-            {input.rivm_results} \
-            {output.report} \
-            "{params.recombinant_clades}" \
-            {output.summary}
+            --fragment-metadata {input.metadata} \
+            --nextclade test_out/clade_assignment_results/nextclade.tsv \
+            --nextclade-wg test_out/clade_assignment_results/nextclade_wg.tsv \
+            --rivm {input.rivm_results} \
+            --clade-name-map {input.name_map} \
+            --virus "{params.virus}" \
+            --recombinant-clades "{params.recombinant_clades}" \
+            --report {output.report} \
+            --summary {output.summary} \
+            --summary-global {output.summary_global}
         """
+
+
+rule plot_clade_comparison:
+    input:
+        report = rules.test_clades.output.report,
+        summary = rules.test_clades.output.summary,
+        gff = "dataset/genome_annotation.gff3",
+    output:
+        # a directory, not a named file: the script writes one subdirectory per arm
+        # (main/, matched/), and the matched arm disappears when
+        # FRAGMENT_MATCHED_REPLICATES is 0, so the exact file set is data-dependent
+        figures = directory("test_out/figures"),
+    shell:
+        """
+        python scripts/plot_clade_comparison.py \
+            --report {input.report} \
+            --summary {input.summary} \
+            --gff {input.gff} \
+            --output-dir test_out/figures
+        """
+
+
+## Full benchmark, including the figures. Requires testing/rivm_results.csv to be
+## current - see the RIVM round-trip section in README.md.
+rule test_all:
+    input:
+        rules.test_clades.output.summary,
+        rules.plot_clade_comparison.output.figures,
 
 
 rule clean:

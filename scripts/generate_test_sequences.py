@@ -170,38 +170,139 @@ def parse_gff_gene_coords(gff_file):
     return gene_coords
 
 
-def random_ungapped_fragment(seq, length):
-    """Return a random subsequence of `length` non-gap/N bases, or None if `seq` is too short."""
-    ungapped_len = len(seq) - seq.count("-") - seq.count("N")
-    if ungapped_len <= length:
+# Default fragment design: log-ish length spacing, denser below 1000nt where the
+# tools actually diverge, x 3 regions x DEFAULT_REPLICATES = a set small enough to
+# push through the RIVM web tool in one sitting.
+DEFAULT_LENGTHS = [100, 200, 300, 500, 700, 1000, 1500, 2500]
+DEFAULT_REPLICATES = 10
+GENOME_REGION = "genome"
+
+# The RIVM typing tool truncates sequence names to 30 characters, so fragment
+# headers carry an opaque id only and all metadata lives in a sidecar TSV.
+MAX_FRAGMENT_ID_LEN = 30
+
+
+def random_fragment(seq, length, max_tries=10):
+    """Pick a random `length`-nt window of `seq`, avoiding gap/N-heavy windows.
+
+    Returns (start, end, subsequence) with coordinates relative to `seq`, or None
+    if `seq` is too short. Windows that are more than 10% gaps/Ns are retried, so a
+    fragment is not scored as a tool failure when it is really just missing data.
+    """
+    if len(seq) <= length:
         return None
-    start = random.randint(0, ungapped_len - length)
-    return seq[start:start + length]
+    best = None
+    for _ in range(max_tries):
+        start = random.randint(0, len(seq) - length)
+        sub = seq[start:start + length]
+        ambiguous = sub.count("-") + sub.count("N") + sub.count("n")
+        if best is None or ambiguous < best[0]:
+            best = (ambiguous, start, sub)
+        if ambiguous <= 0.1 * length:
+            break
+    _, start, sub = best
+    return start, start + length, sub
 
 
-def generate_fragments(sequences_file, rivm_file, clades_file, nextstrain_file ,output_file,
-                       lengths=None, genes=None, gff_file=None):
-    """Generate fragment test sequences."""
+def stratified_picks(records_by_clade, n, prefer=None):
+    """Pick `n` records, round-robin over clades so rare clades are represented.
+
+    `random.choice` over the whole pool would let the few heavily-sequenced clades
+    (C4, B5) supply almost every replicate, which makes the benchmark a measurement
+    of those clades rather than of the dataset.
+
+    Clade order is shuffled per call: iterating a sorted list meant that whenever
+    n was smaller than the number of clades, only the alphabetically-first clades
+    were ever sampled.
+
+    `prefer` is an optional predicate; within a clade, records satisfying it are
+    drawn first. It is used to favour parents carrying both ground truths, so the
+    shared-truth metric keeps as large a denominator as possible.
+    """
+    clades = list(records_by_clade)
+    if not clades:
+        return []
+    random.shuffle(clades)
+    picks, used = [], set()
+    exhausted = 0
+    i = 0
+    while len(picks) < n and exhausted < len(clades):
+        clade = clades[i % len(clades)]
+        pool = [r for r in records_by_clade[clade] if r not in used]
+        if pool:
+            if prefer:
+                preferred = [r for r in pool if prefer(r)]
+                pool = preferred or pool
+            choice = random.choice(pool)
+            picks.append(choice)
+            used.add(choice)
+            exhausted = 0
+        else:
+            exhausted += 1
+        i += 1
+    return picks
+
+
+def aligned_span(gapped, start, end):
+    """Column indices in [start, end) where this aligned record has a real base.
+
+    Working in alignment (reference) coordinates is what lets partial sequences - VP1
+    amplicons, which are the bulk of EV-A71 GenBank records - contribute fragments at
+    all: their covered region is read off the alignment instead of being assumed.
+    """
+    return [i for i in range(start, min(end, len(gapped)))
+            if gapped[i] not in "-." and gapped[i] not in "Nn"]
+
+
+def cut_aligned_fragment(gapped, columns, length):
+    """Cut `length` real bases from an aligned record, within the given columns.
+
+    Returns (ref_start, ref_end, ungapped_fragment) in reference coordinates, or None
+    if the record does not carry `length` bases in that region.
+    """
+    if len(columns) < length:
+        return None
+    offset = random.randint(0, len(columns) - length)
+    chosen = columns[offset:offset + length]
+    fragment = "".join(gapped[i] for i in chosen)
+    return chosen[0], chosen[-1] + 1, fragment
+
+
+def generate_fragments(aligned_file, rivm_file, clades_file, nextstrain_file, output_file,
+                       metadata_file, lengths=None, genes=None, gff_file=None,
+                       replicates=DEFAULT_REPLICATES, matched_replicates=0):
+    """Generate replicated, clade-stratified fragment test sequences.
+
+    Parents are any sequence with a clade call from Nextstrain or RIVM that is not in
+    the Nextclade reference tree, taken from a reference alignment so that partial
+    sequences (mostly VP1 amplicons) can contribute fragments in the regions they
+    actually cover.
+
+    Two arms are produced. The `main` arm lets every region draw from all eligible
+    parents, maximising power per region. The `matched` arm restricts all regions to
+    parents covering every region, so that comparisons *across* regions are not
+    confounded by the parent populations differing between them.
+
+    Writes FASTA records named `{accession}_frag00001` and a sidecar TSV holding the
+    parent accession, region, replicate, arm, true reference coordinates and both
+    ground truths for each fragment.
+    """
     if lengths is None:
-        lengths = range(100, 3100, 100)
+        lengths = DEFAULT_LENGTHS
     if genes is None:
         genes = ["VP1", "3D"]
 
     gene_coords = parse_gff_gene_coords(gff_file)
 
-    # Read all sequences from the input file
-    records = list(SeqIO.parse(sequences_file, "fasta"))
+    aligned = {r.id: str(r.seq) for r in SeqIO.parse(aligned_file, "fasta")}
+    aln_len = max((len(s) for s in aligned.values()), default=0)
+    print(f"{len(aligned)} aligned candidate sequences (alignment length {aln_len})",
+          file=sys.stderr)
 
-    # Read Nextstrain Clades
+    # --- ground truths -------------------------------------------------------------
     nextstrain_df = pd.read_csv(nextstrain_file, sep="\t")
-    meta_ids = set(nextstrain_df["accession"] if "accession" in nextstrain_df.columns else nextstrain_df.iloc[:, 0])
-    records = [r for r in records if r.id in meta_ids]
-
-    ns_map = nextstrain_df.set_index("accession")["clade_membership"].to_dict()
-
-    # filter records NOT in clades file
-    acc = pd.read_csv(clades_file, sep="\t").accession
-    records = [r for r in records if r.id not in acc]
+    ns_map = {k: v for k, v in nextstrain_df.set_index("accession")["clade_membership"].items()
+              if pd.notna(v)}
 
     rivm_map = {}
     if rivm_file:
@@ -211,46 +312,97 @@ def generate_fragments(sequences_file, rivm_file, clades_file, nextstrain_file ,
             rivm_map = rivm.set_index("accession")["RIVM"].to_dict()
         elif "name" in rivm:
             rivm_map = rivm.set_index("name")["VP1 subgenogroup"].to_dict()
-        else: print("neither accession nor name in ", rivm_file,". Please check!")
+        else:
+            print("neither accession nor name in ", rivm_file, ". Please check!")
 
-    # Most records are already partial (e.g. VP1-only), so only keep, per gene,
-    # the records long enough to actually contain that gene's coordinates.
-    gene_records = {
-        gene: [r for r in records if len(r.seq) >= end]
-        for gene, (start, end) in gene_coords.items()
-    }
+    # Exclude sequences that are in the Nextclade reference tree: testing on them would
+    # measure Nextclade against its own training data. NB `in` on a pandas Series tests
+    # the index, not the values, so this must go through a set.
+    tree_accessions = set(pd.read_csv(clades_file, sep="\t").accession)
 
+    pool = [acc for acc in aligned
+            if acc not in tree_accessions and (acc in ns_map or acc in rivm_map)]
+    print(f"{len(pool)} candidate parents with a clade call, after excluding "
+          f"{len(tree_accessions)} reference-tree sequences", file=sys.stderr)
+
+    # --- region definitions ---------------------------------------------------------
+    regions = [(g, gene_coords[g]) for g in genes if g in gene_coords]
+    for g in genes:
+        if g not in gene_coords:
+            print(f"Gene {g} not found in GFF3 annotation, skipping.", file=sys.stderr)
+    regions.append((GENOME_REGION, (0, aln_len)))
+
+    # Precompute each parent's covered columns per region, once.
+    coverage = {region: {acc: aligned_span(aligned[acc], start, end) for acc in pool}
+                for region, (start, end) in regions}
+
+    # Parents usable in the matched arm cover every region at the largest length asked of it.
+    matched_pool = [acc for acc in pool
+                    if all(len(coverage[region][acc]) >= min(max(lengths), end - start)
+                           for region, (start, end) in regions)]
+    print(f"{len(matched_pool)} parents cover every region (matched arm)", file=sys.stderr)
+
+    def group_by_clade(accessions):
+        grouped = {}
+        for acc in accessions:
+            clade = ns_map.get(acc) or rivm_map.get(acc)
+            if clade and str(clade) != "nan":
+                grouped.setdefault(str(clade), []).append(acc)
+        return grouped
+
+    rows = []
+    counter = 0
     with open(output_file, "w") as out_handle:
-        for length in lengths:
-            for gene in genes:
-                if gene not in gene_coords:
-                    print(f"Gene {gene} not found in GFF3 annotation, skipping.", file=sys.stderr)
-                    continue
-                eligible = gene_records[gene]
-                if not eligible:
-                    continue
-                record = random.choice(eligible)
-                start, end = gene_coords[gene]
-                fragment = random_ungapped_fragment(record.seq[start:end], length)
-                if fragment is not None:
-                    cl = rivm_map.get(record.id, "NA")
-                    ns = ns_map.get(record.id, "NA")
-                    header = f"{record.id}_partial_{length}_{gene}|{ns}|{cl}"
-                    out_handle.write(f">{header}\n{fragment}\n")
+        for arm, arm_pool, arm_reps in (("main", pool, replicates),
+                                        ("matched", matched_pool, matched_replicates)):
+            if not arm_reps or not arm_pool:
+                continue
+            for length in lengths:
+                for region, (start, end) in regions:
+                    eligible = [a for a in arm_pool if len(coverage[region][a]) >= length]
+                    if not eligible:
+                        continue
+                    both_truths = lambda a: a in ns_map and a in rivm_map
+                    picks = stratified_picks(group_by_clade(eligible), arm_reps,
+                                             prefer=both_truths)
+                    for replicate, acc in enumerate(picks, start=1):
+                        cut = cut_aligned_fragment(aligned[acc], coverage[region][acc], length)
+                        if cut is None:
+                            continue
+                        ref_start, ref_end, fragment = cut
+                        counter += 1
+                        frag_id = f"{acc}_frag{counter:05d}"
+                        out_handle.write(f">{frag_id}\n{fragment}\n")
+                        rows.append({
+                            "fragment_id": frag_id,
+                            "accession": acc,
+                            "length": length,
+                            "gene": region,
+                            "arm": arm,
+                            "replicate": replicate,
+                            # reference coordinates, read off the alignment rather than
+                            # inferred later from Nextclade's own alignment of the fragment
+                            "start": ref_start,
+                            "end": ref_end,
+                            "parent_covered_nt": len(coverage[GENOME_REGION][acc]),
+                            "nextstrain_clade": ns_map.get(acc, "NA"),
+                            "rivm_wg_clade": rivm_map.get(acc, "NA"),
+                        })
 
-            record = random.choice(records)
-            seq_len = len(record.seq)
-            while seq_len < length:
-                record = random.choice(records)
-                seq_len = len(record.seq)
-            cl = rivm_map.get(record.id, "NA")
-            ns = ns_map.get(record.id, "NA")
-            start = random.randint(0, seq_len - length)
-            fragment_seq = record.seq[start:start+length]
-            header = f"{record.id}_partial_{length}|{ns}|{cl}"
-            out_handle.write(f">{header}\n{fragment_seq}\n")
+    meta = pd.DataFrame(rows).fillna("NA")
+    meta["has_both_truths"] = ((meta["nextstrain_clade"] != "NA")
+                               & (meta["rivm_wg_clade"] != "NA")).astype(int)
+    ids = meta["fragment_id"]
+    assert ids.is_unique, "fragment ids are not unique"
+    too_long = ids[ids.str.len() > MAX_FRAGMENT_ID_LEN]
+    assert too_long.empty, (
+        f"fragment ids exceed the RIVM {MAX_FRAGMENT_ID_LEN}-char name limit: {list(too_long)}"
+    )
+    meta.to_csv(metadata_file, sep="\t", index=False)
+    print(f"Wrote {len(meta)} fragments to {output_file} and metadata to {metadata_file}",
+          file=sys.stderr)
 
-    return sum(1 for line in open(output_file) if line.startswith(">"))
+    return len(meta)
 
 def generate_recombinants(sequences_file, metadata, clades_file, ev_file, 
                           output_file, inter_count=10, intra_count=10, min_length=3500):
@@ -311,6 +463,18 @@ if __name__ == "__main__":
     parser.add_argument("--clades", required=True, help="Clades metadata TSV")
     parser.add_argument("--rivm", required=False, help = "RIVM Clade Assignment")
     parser.add_argument("--output-fragments", required=True, help="Output fragments FASTA")
+    parser.add_argument("--output-fragment-metadata", required=False,
+                        help="Output fragment metadata TSV (default: alongside the fragments FASTA)")
+    parser.add_argument("--lengths", required=False, nargs="+", type=int, default=None,
+                        help=f"Fragment lengths to generate (default: {DEFAULT_LENGTHS})")
+    parser.add_argument("--replicates", required=False, type=int, default=DEFAULT_REPLICATES,
+                        help="Fragments per length x region cell in the main arm")
+    parser.add_argument("--matched-replicates", required=False, type=int, default=0,
+                        help="Fragments per cell in the matched arm, where every region draws "
+                             "from parents covering all regions (0 disables the arm)")
+    parser.add_argument("--aligned", required=False,
+                        help="Reference alignment of candidate parent sequences; required for "
+                             "fragment generation so partial sequences can be placed")
     parser.add_argument("--output-recombinants", required=True, help="Output recombinants FASTA")
     parser.add_argument("--output-ev", required=False, help="Output EV species sequences FASTA (if fetching from NCBI)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -357,8 +521,20 @@ if __name__ == "__main__":
     else:
         rivm = None
 
-    n_frags = generate_fragments(args.sequences, rivm, args.clades,args.nextstrain, args.output_fragments,
-                                  genes=args.genes, gff_file=gff_file)
+    fragment_metadata = (
+        Path(args.output_fragment_metadata) if args.output_fragment_metadata
+        else Path(args.output_fragments).with_name("fragment_metadata.tsv")
+    )
+
+    if not args.aligned:
+        sys.exit("--aligned is required: fragments are cut from a reference alignment so that "
+                 "partial sequences can be placed in reference coordinates")
+
+    n_frags = generate_fragments(args.aligned, rivm, args.clades, args.nextstrain,
+                                 args.output_fragments, fragment_metadata,
+                                 lengths=args.lengths, genes=args.genes, gff_file=gff_file,
+                                 replicates=args.replicates,
+                                 matched_replicates=args.matched_replicates)
     n_recomb = generate_recombinants(args.sequences, args.nextstrain, args.clades, ev_file, args.output_recombinants)
     
     print(f"Generated {n_frags} fragments and {n_recomb} recombinants")

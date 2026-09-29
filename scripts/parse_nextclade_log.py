@@ -42,7 +42,33 @@ def parse_nextclade_log(log_file):
     
     return failed_sequences, coverage_pcts
 
-def extract_qualifying_sequences_table(log_file):
+# Fragment test sequences are named by an opaque short id (frag00001) because the RIVM
+# typing tool truncates names to 30 characters; their accession, length and region live
+# in test_out/fragment_metadata.tsv. Older fragment sets embedded that in the name, so
+# both spellings are recognised here.
+# ids are '<accession>_frag00001'; the bare 'frag00001' form is also accepted
+FRAGMENT_ID_RE = re.compile(r'^(?:.+_)?frag\d+$')
+
+
+def is_fragment(seq_id):
+    """True if `seq_id` names a fragment test sequence."""
+    return bool(FRAGMENT_ID_RE.match(seq_id)) or '_partial_' in seq_id
+
+
+def load_fragment_metadata(path):
+    """Load fragment_metadata.tsv into {fragment_id: {accession, length, gene}}."""
+    if not path or not Path(path).exists():
+        return {}
+    meta = {}
+    with open(path) as handle:
+        header = handle.readline().rstrip('\n').split('\t')
+        for line in handle:
+            row = dict(zip(header, line.rstrip('\n').split('\t')))
+            meta[row['fragment_id']] = row
+    return meta
+
+
+def extract_qualifying_sequences_table(log_file, fragment_metadata=None):
     """
     Build a table of failed sequences worth reviewing manually:
       - sequences whose name contains a pipe ('ACCESSION | Virus'): accession, virus, seed cover
@@ -73,9 +99,13 @@ def extract_qualifying_sequences_table(log_file):
                     'length_or_breakpoint': '',
                     'seed_cover_pct': coverage,
                 })
-            elif '_partial_' in full_id:
-                accession, rest = full_id.split('_partial_', 1)
-                length = rest.split('_')[0]
+            elif is_fragment(full_id):
+                if full_id in (fragment_metadata or {}):
+                    info = fragment_metadata[full_id]
+                    accession, length = info['accession'], info['length']
+                else:  # legacy name with the details embedded
+                    accession, rest = full_id.split('_partial_', 1)
+                    length = rest.split('_')[0]
                 rows.append({
                     'accession': accession,
                     'category': 'partial',
@@ -190,7 +220,7 @@ def categorize_test_sequences(failed_sequences, fasta_file, qc_status, virus_nam
             categories['inter_recombinants'].append(seq_id)
         elif seq_id.startswith('intra_'):  # Intra-recombinants
             categories['intra_recombinants'].append(seq_id)
-        elif '_partial_' in seq_id:  # Fragments
+        elif is_fragment(seq_id):  # Fragments
             categories['fragments'].append(seq_id)
         elif related_label in description or related_patterns and any(p in description for p in related_patterns) or re.sub(r'\d+', '', virus_name).lower() in description.lower():
             if virus_name not in description and short_name not in description:
@@ -517,6 +547,8 @@ if __name__ == "__main__":
     parser.add_argument("--tree-file", default="out-dataset/tree.json", help="Dataset tree.json used to derive private-mutation stats")
     parser.add_argument("--short-name", default="EV", help="Short abbreviation of the target virus (e.g. 'EV-D68')")
     parser.add_argument("--related-label", default=None, help="Optional label for a closely related species to flag separately (e.g. 'EV-A')")
+    parser.add_argument("--fragment-metadata", default="test_out/fragment_metadata.tsv",
+                        help="Fragment metadata TSV, used to resolve frag##### ids back to accession/length")
     parser.add_argument("--related-patterns", default=None, help="Comma-separated substrings identifying --related-label in sequence descriptions (e.g. 'EV-A,CVA')")
     args = parser.parse_args()
 
@@ -550,5 +582,6 @@ if __name__ == "__main__":
     summarize_results(failed_seqs, coverage_vals, total_seqs, seq_lengths, qc_status, fasta_file, output_dir,
                        virus_name, short_name, related_label, related_patterns)
 
-    qualifying_rows = extract_qualifying_sequences_table(log_file)
+    qualifying_rows = extract_qualifying_sequences_table(
+        log_file, load_fragment_metadata(args.fragment_metadata))
     write_qualifying_sequences_table(qualifying_rows, output_dir)
