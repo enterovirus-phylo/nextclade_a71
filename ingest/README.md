@@ -1,168 +1,185 @@
-# Ingest Workflow
+# Ingest
 
-The `ingest` directory contains scripts and workflow files for automated data ingestion and preparation. Sequences and corresponding metadata are fetched from GenBank, then cleaned and curated. This process restructures and formats the data into formats suitable for downstream phylogenetic analyses.
+Downloads sequences and metadata for one taxon from NCBI and curates them into
+the two files the dataset build needs:
 
----
+- `data/sequences.fasta`
+- `data/metadata.tsv`
 
-## Directory Overview
+Curation normalises dates to ISO format, resolves place names to a consistent
+region/country/division hierarchy, tidies author lists, and applies any manual
+corrections you record. Both files are then copied up to the project's top-level
+`data/` directory.
 
-- **`Snakefile`** — Snakemake workflow file that orchestrates the ingest process
-- **`bin/`** — Custom scripts used in the ingest workflow
-  - [`generate_from_genbank.py`](bin/generate_from_genbank.py) — Downloads and parses GenBank files into required formats
-- **`config/`** — Configuration files (e.g., `config.yaml`)
-- **`data/`** — Input and output data for the ingest process
-- **`source-data/`** — Annotations and geo-location rules
-- **`vendored/`** — Vendored scripts from the central Nextstrain ingest repository
-- **`workflow/`** — Snakemake rules for the ingest workflow
-
----
-
-## Getting Started
-
-### Prerequisites
-
-Ensure you have the following installed:
-- Python 3.x
-- Snakemake
-- Required packages: `csvtk`, `nextclade`, `tsv-utils`, `seqkit`, `zip`, `unzip`, `entrez-direct`, `ncbi-datasets-cli` (installable via conda-forge/bioconda)
+The main workflow runs all of this for you while `FETCH_SEQUENCES = True`, so
+you normally do not need to invoke it directly. Read on if you want to run it on
+its own or change what it collects.
 
 ---
 
-## Workflow Setup
+## Layout
 
-### Step 1: Prepare Reference Files
+| Path | Contents |
+|---|---|
+| `snakefile` | The workflow itself. |
+| `config/config.yaml` | Which taxon to fetch, which fields to keep, how to curate them. |
+| `workflow/snakemake_rules/` | The rules, split by stage: fetch, curate, sort. |
+| `source-data/` | Manual corrections: per-accession annotations and local geolocation rules. |
+| `bin/` | Standalone helper scripts, kept for reference; the default route does not use them. |
+| `data/` | Downloaded and intermediate files. Not version-controlled. |
 
-[Nextclade](https://clades.nextstrain.org/) is used during ingest to align sequences to a reference and assign them to clades. It requires reference files in specific formats (`reference.fasta` and `genome_annotation.gff3`).
+---
 
-#### 1.1 Verify Configuration
+## Configuration
 
-Open [`config/config.yaml`](config/config.yaml) and confirm that the `ncbi_taxon_id` is correct for your pathogen.
+Everything lives in [`config/config.yaml`](config/config.yaml).
 
-For EV-A71, this should be:
+### The one setting you must change
+
 ```yaml
-ncbi_taxon_id: 39054
+ncbi_taxon_id: 42789
 ```
 
-#### 1.2 Generate Reference Files from GenBank
+Find the numeric id for your virus in the
+[NCBI Taxonomy browser](https://www.ncbi.nlm.nih.gov/taxonomy). The workflow
+refuses to start while this is still a placeholder.
 
-Run the `generate_from_genbank.py` script to create properly formatted reference files:
+Pick a taxon at the level you actually want. A species-level id pulls in every
+serotype below it; if you want one serotype, use its own id.
 
-```bash
-python3 bin/generate_from_genbank.py --reference "AY426531.1" --output-dir data/references/
+### Metadata fields
+
+`ncbi_datasets_fields` lists what to request from NCBI. The
+[NCBI Datasets field reference](https://www.ncbi.nlm.nih.gov/datasets/docs/v2/reference-docs/command-line/dataformat/tsv/dataformat_tsv_virus-genome/)
+documents the available names. `curate.field_map` then renames them to the
+column names augur and the dataset build expect — so if you add a field, add it
+to both.
+
+The main workflow's tree colourings rely on `date`, `country` and `region`
+being present, so keep those.
+
+### Manual corrections
+
+NCBI records contain mistakes, and the fix belongs in version control rather
+than in a hand-edited TSV that the next download overwrites.
+
+[`source-data/annotations.tsv`](source-data/annotations.tsv) overrides individual
+fields: one correction per line, tab-separated, keyed on the **unversioned**
+accession.
+
+```
+AY741551	country	Sierra Leone
+AY603973	date	1961-XX-XX
 ```
 
-**During execution**, you will be prompted to specify CDS annotations. Use these inputs for automatic annotation:
-   - `[0]` — Select the first option for feature type
-   - `[product]` or press Enter for manual selection — Choose how to identify proteins
-   - `[2]` — Select the CDS annotation method
+[`source-data/geolocation-rules.tsv`](source-data/geolocation-rules.tsv) maps raw
+NCBI location strings onto a consistent hierarchy, with `*` matching anything at
+that level:
 
-**Outputs:**
-- `data/references/reference.fasta` — Reference sequence in FASTA format
-- `data/references/genome_annotation.gff3` — Genome annotation in GFF3 format
-- `data/references/pathogen.json` — Nextclade pathogen configuration
+```
+raw_region/raw_country/raw_division/raw_location	region/country/division/location
+Africa/Cote d'Ivoire/*/*	Africa/Côte d'Ivoire/*/*
+```
 
-> [!NOTE]  
-> For some pathogens, common fields may not be available in the CDS set. In such cases, leave the input blank and manually assign CDS names when prompted.
+These are applied on top of the
+[shared Nextstrain rules](https://github.com/nextstrain/ncov-ingest/blob/master/source-data/gisaid_geoLocationRules.tsv),
+which the workflow downloads, so you only need entries for the cases those get
+wrong.
+
+> [!NOTE]
+> Both files arrive pre-populated with corrections from the pathogen this
+> template grew out of. They are keyed on specific accessions, so they do
+> nothing for an unrelated virus, but you may want to clear them out to keep
+> your own corrections easy to find.
 
 ---
 
-### Step 2: Run the Ingest Workflow
+## Running it on its own
 
-#### 2.1 Make Scripts Executable (if needed)
-
-On Unix-like systems, you may need to make the scripts executable:
-
-```bash
-chmod +x ./vendored/* ./bin/*
-```
-
-#### 2.2 Execute the Workflow
-
-Run the Snakemake workflow from within the `ingest/` directory:
+From inside this directory:
 
 ```bash
 snakemake --cores 9 all
 ```
 
-**What this does:**
-1. Fetches sequences and metadata from NCBI Virus based on the taxon ID
-2. Runs Nextclade to align sequences and assign clades
-3. Cleans and curates metadata
-4. Outputs formatted files to `data/`:
-   - `sequences.fasta` — Curated sequences
-   - `metadata.tsv` — Cleaned and standardized metadata
+Override a setting for one run without editing the file:
 
-**Outputs are placed in:**
-- `../data/sequences.fasta` (for use by the main workflow)
-- `../data/metadata.tsv` (for use by the main workflow)
+```bash
+snakemake --cores 9 all --config ncbi_taxon_id=42789
+```
 
----
+Some scripts may need the executable bit, depending on how you checked the
+repository out:
 
-## Workflow Outputs
-
-After successful completion, the following files will be available in the parent `data/` directory:
-
-| File | Description |
-|------|-------------|
-| `sequences.fasta` | Curated EV-A71 sequences downloaded from NCBI |
-| `metadata.tsv` | Standardized metadata including collection dates, locations, and authors |
-
-These files are used as inputs for the main Nextclade dataset workflow.
+```bash
+chmod +x ./bin/*
+```
 
 ---
 
-## Customization
+## How the download works
 
-### Modifying Metadata Fields
+Two routes exist, and this template is set up for the first:
 
-Edit the [config.yaml](config/config.yaml#L100) to customize which metadata fields are extracted and how they are formatted.
+1. **NCBI Datasets** (default) — takes a taxon id, returns sequences and a
+   metadata table in one package. Fast, and needs no custom parsing.
+2. **Entrez** — takes a free-text search term and returns full GenBank records,
+   which carry fields NCBI Datasets does not expose.
 
-### Adjusting Sequence Filters
-
-Modify the Snakemake rules in `workflow/` and `config/config.yaml` to change filtering criteria (e.g., minimum length, date ranges, geographic regions).
-
-### Updating Geo-location Rules
-
-Edit files in `source-data/` to improve geographic location standardization and parsing.
+The Entrez route is left in place as a starting point but is **not wired up**:
+it depends on a `vendored/fetch-from-ncbi-entrez` script that this template does
+not ship, and on a parser you would have to write yourself. Use route 1 unless
+you specifically need a field only GenBank records carry, in which case see
+[`nextstrain/ingest`](https://github.com/nextstrain/ingest) for the vendored
+scripts and the `git subrepo` workflow for keeping them current.
 
 ---
 
-## Updating Vendored Scripts
+## Stages
 
-This repository uses [`git subrepo`](https://github.com/ingydotnet/git-subrepo) to manage vendored scripts in the `vendored/` directory. These scripts are maintained in the central Nextstrain ingest repository.
+| Rule | What it does |
+|---|---|
+| `fetch_ncbi_dataset_package` | Downloads the NCBI Datasets zip for the taxon. Retries on network errors. |
+| `extract_ncbi_dataset_sequences` | Unpacks the genomic FASTA. |
+| `format_ncbi_dataset_report` | Turns the metadata into TSV and splits the versioned accession into `accession` and `accession_version`. |
+| `format_ncbi_datasets_ndjson` | Joins sequences and metadata into one NDJSON stream. |
+| `curate` | Renames fields, normalises dates and place names, abbreviates authors, applies manual corrections. |
+| `sort` | Removes duplicate sequences. |
+| `metadata` | Keeps the metadata rows whose sequences survived deduplication. |
 
-### To Update Vendored Scripts:
-
-1. **Install `git subrepo`:**  
-   Follow the [installation guide](https://github.com/ingydotnet/git-subrepo#installation).
-
-2. **Pull the latest changes:**  
-   Follow the instructions in [`vendored/README.md`](vendored/README.md#vendoring) to sync with the upstream repository.
-
-3. **Test after updating:**  
-   Run the ingest workflow to ensure compatibility with the updated scripts.
+The curate step is a single pipeline of `augur curate` commands streaming NDJSON
+between them. To add a step of your own, read NDJSON records from stdin and
+write them to stdout, and slot the command into the pipeline in
+[`workflow/snakemake_rules/curate.smk`](workflow/snakemake_rules/curate.smk).
 
 ---
 
 ## Troubleshooting
 
-### Common Issues
+**`CONFIGURATION ERROR: ncbi_taxon_id ... is not set`**
+Put your taxon id in `config/config.yaml`.
 
-**Problem:** Script fails with "permission denied"  
-**Solution:** Ensure scripts are executable: `chmod +x ./vendored/* ./bin/*`
+**`datasets: command not found`**
+The NCBI Datasets CLI is missing. It is part of `environment.yml`, so activate
+the `nextclade` environment, or install it on its own with
+`conda install -c conda-forge ncbi-datasets-cli`.
 
-**Problem:** No sequences downloaded  
-**Solution:** Check that `ncbi_taxon_id` in `config/config.yaml` is correct and that NCBI Virus has sequences available
+**The download returns far fewer sequences than expected**
+Check the taxon id resolves to what you think, and at the level you want:
 
-**Problem:** Metadata parsing errors  
-**Solution:** Review geo-location rules in `source-data/` and ensure they cover the locations in your dataset
+```bash
+datasets summary virus genome taxon 42789
+```
 
----
+**`N sequences have no metadata row`**
+The curate step dropped records the download had provided. `logs/curate.txt`
+says why — usually an unparseable date or a strain name that failed the regex.
 
-## Additional Resources
+**Dates come out as `XXXX-XX-XX`**
+That is the marker for an unknown or ambiguous date, and is expected for older
+records. If it affects sequences that do have a date in GenBank, add the format
+to `curate.expected_date_formats`.
 
-- [Nextstrain Ingest Documentation](https://docs.nextstrain.org/projects/ingest/)
-- [Nextclade Documentation](https://docs.nextstrain.org/projects/nextclade/)
-- [Snakemake Documentation](https://snakemake.readthedocs.io/)
-
-For questions or issues specific to this workflow, please [open an issue](https://github.com/enterovirus-phylo/dataset-template-inferred-root/issues).
+**A country or region is wrong or empty**
+Add a rule to `source-data/geolocation-rules.tsv`, or correct the individual
+record in `source-data/annotations.tsv`.
