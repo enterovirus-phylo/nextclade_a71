@@ -4,7 +4,7 @@ from pathlib import Path
 REFERENCE_ACCESSION =   "U22521"
 TAXON_ID =              39054
 GENES =                 ["VP4", "VP2", "VP3", "VP1", "2A", "2B", "2C", "3A", "3B", "3C", "3D"]
-ALLOWED_DIVERGENCE =    "2000" # was 
+ALLOWED_DIVERGENCE =    "1400"
 MIN_DATE =              "1970-01-01"
 MIN_LENGTH =            "6400" # was 6000 for whole genome build on Nextstrain
 MAX_SEQS =              "1200" # tree will be subsampled
@@ -37,6 +37,9 @@ INFERRED_ANCESTOR =     "resources/inferred-root.fasta"
 NON_TARGET_SEQUENCES =  "testing/non-EV-A_sequence.fasta"  # sequences from other species, used as negative controls
 RELATED_SPECIES_FASTA = "testing/EV_A.fasta"                # other serotypes of the same species (skips NCBI fetch if present)
 RIVM_CLADES =            "resources/subgenotypes_rivm.csv"  # RIVM clade/subgenogroup assignment used to label test fragments
+
+# To test recently released sequences, add them to this file (one accession per line) and they will be included in the test dataset
+NEW_ADDS = "testing/new_adds.txt"
 
 # Test rule parameters (rule `test`) - species-specific, override per virus/species
 VIRUS_ABBREV =           "EV-A71"    # short abbreviation for the target virus, used in test sequence labels/filenames
@@ -217,23 +220,18 @@ if STATIC_ANCESTRAL_INFERRENCE and not INFERRENCE_RERUN:
 
             csvtk mutate2 -t \
                 -n url \
-                -e '"https://www.ncbi.nlm.nih.gov/nuccore/" + ${params.strain_id_field}' \
-                {input.meta} > meta.tmp
-
-            csvtk mutate2 -t \
-                -n url \
                 -e '"https://github.com/enterovirus-phylo/nextclade_a71/blob/master/resources/inferred-root.fasta"' \
                 {input.meta_ancestral} > ancestral.tmp
             
             echo "Merging metadata..."
             augur merge \
-                --metadata metadata=meta.tmp ancestral=ancestral.tmp rivm={input.RIVM} \
+                --metadata metadata={input.meta} ancestral=ancestral.tmp rivm={input.RIVM} \
                 --metadata-id-columns {params.strain_id_field} \
                 --output-metadata {output.meta}
 
             echo "Static ancestral sequence imported successfully!"
 
-            rm meta.tmp ancestral.tmp
+            rm ancestral.tmp
             """
 
 rule index_sequences:
@@ -383,6 +381,7 @@ rule exclude:
         exclude = EXCLUDE,
         outliers = rules.get_outliers.output.outliers,
         example = INCLUDE_EXAMPLES,
+        new_seqs = NEW_ADDS
     params:
         strain_id_field = ID_FIELD,
     output:
@@ -398,7 +397,7 @@ rule exclude:
             --sequence-index {input.sequence_index} \
             --metadata {input.metadata} \
             --metadata-id-columns {params.strain_id_field} \
-            --exclude {input.exclude} {input.outliers} {input.example} \
+            --exclude {input.exclude} {input.outliers} {input.example} {input.new_seqs} \
             --output-sequences {output.filtered_sequences} \
             --output-metadata {output.filtered_metadata} \
             --output-strains {output.strains} \
@@ -1016,4 +1015,30 @@ rule clean:
         """
         rm -v ingest/data/*.* data/*.*
         rm -rv results out-dataset test_out dataset.zip tmp
+        """
+
+
+rule test_new_seqs:
+    input:
+        dataset = rules.assemble_dataset.output.dataset_zip,
+        sequences = SEQUENCES,
+        new_seqs = NEW_ADDS,
+    output:
+        fasta = "test_out/new_sequences.fasta",
+        report = "test_out/new_sequences_report.tsv",
+    log:
+        "logs/new_sequences.log"
+    shell:
+        """
+        mkdir -p test_out/new_sequences_results
+
+        seqkit grep -f {input.new_seqs} {input.sequences} > {output.fasta}
+
+        time nextclade3 run \
+            --input-dataset {input.dataset} \
+            --output-all test_out/new_sequences_results \
+            --output-tsv {output.report} \
+            {output.fasta} > {log} 2>&1
+
+        printf "\nNextclade3 run completed. Log written to {log}.\n"
         """

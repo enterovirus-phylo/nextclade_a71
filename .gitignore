@@ -41,3 +41,6 @@ tidy-tree/*
 #testing
 testing/extract_fasta_from_accession.ipynb
 testing/missing_RIVM.fasta
+
+dag.png
+ingest/vendored/*
