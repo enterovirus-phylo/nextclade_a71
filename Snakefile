@@ -381,9 +381,9 @@ rule exclude:
         exclude = EXCLUDE,
         outliers = rules.get_outliers.output.outliers,
         example = INCLUDE_EXAMPLES,
-        new_seqs = NEW_ADDS
     params:
         strain_id_field = ID_FIELD,
+        new_adds = NEW_ADDS,
     output:
         filtered_sequences = "results/filtered_aligned.fasta",
         filtered_metadata = "results/filtered_metadata.tsv",
@@ -397,7 +397,7 @@ rule exclude:
             --sequence-index {input.sequence_index} \
             --metadata {input.metadata} \
             --metadata-id-columns {params.strain_id_field} \
-            --exclude {input.exclude} {input.outliers} {input.example} {input.new_seqs} \
+            --exclude {input.exclude} {input.outliers} {input.example} \
             --output-sequences {output.filtered_sequences} \
             --output-metadata {output.filtered_metadata} \
             --output-strains {output.strains} \
