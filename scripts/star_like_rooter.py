@@ -480,6 +480,8 @@ def main():
             recombinant_clades,
         )
 
+        unclassified_log_file = "logs/unclassified_terminals.log"
+
         unclassified = find_unclassified_terminals(tree, strain_to_group)
         if unclassified:
             pct = 100 * len(unclassified) / len(terminal_names)
@@ -490,7 +492,11 @@ def main():
                 f"to the current tree (e.g. built from a different subsample) and can "
                 f"silently fragment recombinant clades that should be merged. "
                 f"Missing accessions (up to 10 shown): {sorted(unclassified)[:10]}"
+                f"All missing accessions will be logged to {unclassified_log_file} for inspection."
             )
+        with open(unclassified_log_file, "w") as f:
+            for name in sorted(unclassified):
+                f.write(f"{name}\n")
 
         #%%
         # Create star tree
