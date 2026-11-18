@@ -30,6 +30,15 @@
     "gapAlignmentSide": "left"
   },
   "defaultCds": "VP1",
+  "recombination": {
+    "enabled": true,
+    "gamma": 1.35e-6,
+    "muW": 0.0058,
+    "muR": 0.15,
+    "minRegionLength": 250,
+    "maxRegionMissingFraction": 0.5,
+    "maxRecombinantFraction": 0.70
+  },
   "compatibility": {
     "cli": "3.0.0",
     "web": "3.0.0"
